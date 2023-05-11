@@ -1,80 +1,93 @@
-import cv2 as cv
+# first, import all necessary modules
+from pathlib import Path
 
-import sys
+import blobconverter
+import cv2
+import depthai
+import numpy as np
 
-#
+# Pipeline tells DepthAI what operations to perform when running - you define all of the resources used and flows here
+pipeline = depthai.Pipeline()
 
-print(cv.__version__)
+# First, we want the Color camera as the output
+cam_rgb = pipeline.createColorCamera()
+#cam_rgb.setPreviewSize(300, 300)  # 300x300 will be the preview frame size, available as 'preview' output of the node
+cam_rgb.setPreviewSize(256,256) 
+cam_rgb.setInterleaved(False)
+#cam_rgb.setColorOrder(depthai.ColorCameraProperties.ColorOrder.RGB)
+#cam_rgb.setBoardSocket(depthai.CameraBoardSocket.RGB)
+
+# Next, we want a neural network that will produce the detections
+detection_nn = pipeline.createMobileNetDetectionNetwork()
+# Blob is the Neural Network file, compiled for MyriadX. It contains both the definition and weights of the model
+# We're using a blobconverter tool to retreive the MobileNetSSD blob automatically from OpenVINO Model Zoo
 
 
+#detection_nn.setBlobPath(blobconverter.from_zoo(name='mobilenet-ssd', shaves=6))
+detection_nn.setBlobPath('/home/josh/code/CMPSCI-5390-Semester-Project/model/asl.blob')
+
+# Next, we filter out the detections that are below a confidence threshold. Confidence can be anywhere between <0..1>
+detection_nn.setConfidenceThreshold(0.3)
+# Next, we link the camera 'preview' output to the neural network detection input, so that it can produce detections
+cam_rgb.preview.link(detection_nn.input)
+
+# XLinkOut is a "way out" from the device. Any data you want to transfer to host need to be send via XLink
+xout_rgb = pipeline.createXLinkOut()
+# For the rgb camera output, we want the XLink stream to be named "rgb"
+xout_rgb.setStreamName("rgb")
+# Linking camera preview to XLink input, so that the frames will be sent to host
+cam_rgb.preview.link(xout_rgb.input)
+
+# The same XLinkOut mechanism will be used to receive nn results
+xout_nn = pipeline.createXLinkOut()
+xout_nn.setStreamName("nn")
+detection_nn.out.link(xout_nn.input)
+
+# Pipeline is now finished, and we need to find an available device to run our pipeline
+# we are using context manager here that will dispose the device after we stop using it
+with depthai.Device(pipeline) as device:
+    # From this point, the Device will be in "running" mode and will start sending data via XLink
+
+    # To consume the device results, we get two output queues from the device, with stream names we assigned earlier
+    q_rgb = device.getOutputQueue("rgb")
+    q_nn = device.getOutputQueue("nn")
+
+    # Here, some of the default values are defined. Frame will be an image from "rgb" stream, detections will contain nn results
+    frame = None
+    detections = []
+
+    # Since the detections returned by nn have values from <0..1> range, they need to be multiplied by frame width/height to
+    # receive the actual position of the bounding box on the image
+    def frameNorm(frame, bbox):
+        normVals = np.full(len(bbox), frame.shape[0])
+        normVals[::2] = frame.shape[1]
+        return (np.clip(np.array(bbox), 0, 1) * normVals).astype(int)
 
 
-
-
-def main(argv):
-    #capture from camera at location 0
-    cap = cv.VideoCapture(0)
-    # Change the camera setting using the set() function
-    # cap.set(cv2.cv.CV_CAP_PROP_EXPOSURE, -6.0)
-    # cap.set(cv2.cv.CV_CAP_PROP_GAIN, 4.0)
-    # cap.set(cv2.cv.CV_CAP_PROP_BRIGHTNESS, 144.0)
-    # cap.set(cv2.cv.CV_CAP_PROP_CONTRAST, 27.0)
-    # cap.set(cv2.cv.CV_CAP_PROP_HUE, 13.0) # 13.0
-    # cap.set(cv2.cv.CV_CAP_PROP_SATURATION, 28.0)
-    # Read the current setting from the camera
-    test = cap.get(cv.CAP_PROP_POS_MSEC)
-    ratio = cap.get(cv.CAP_PROP_POS_AVI_RATIO)
-    frame_rate = cap.get(cv.CAP_PROP_FPS)
-    width = cap.get(cv.CAP_PROP_FRAME_WIDTH)
-    height = cap.get(cv.CAP_PROP_FRAME_HEIGHT)
-    brightness = cap.get(cv.CAP_PROP_BRIGHTNESS)
-    contrast = cap.get(cv.CAP_PROP_CONTRAST)
-    saturation = cap.get(cv.CAP_PROP_SATURATION)
-    hue = cap.get(cv.CAP_PROP_HUE)
-    gain = cap.get(cv.CAP_PROP_GAIN)
-    exposure = cap.get(cv.CAP_PROP_EXPOSURE)
-    print("Test: ", test)
-    print("Ratio: ", ratio)
-    print("Frame Rate: ", frame_rate)
-    print("Height: ", height)
-    print("Width: ", width)
-    print("Brightness: ", brightness)
-    print("Contrast: ", contrast)
-    print("Saturation: ", saturation)
-    print("Hue: ", hue)
-    print("Gain: ", gain)
-    print("Exposure: ", exposure)
+    # Main host-side application loop
     while True:
-        ret, img = cap.read()
-        cv.imshow("input", img)
+        # we try to fetch the data from nn/rgb queues. tryGet will return either the data packet or None if there isn't any
+        in_rgb = q_rgb.tryGet()
+        in_nn = q_nn.tryGet()
 
-        key = cv.waitKey(10)
-        if key == 27:
+        if in_rgb is not None:
+            # If the packet from RGB camera is present, we're retrieving the frame in OpenCV format using getCvFrame
+            frame = in_rgb.getCvFrame()
+
+        if in_nn is not None:
+            # when data from nn is received, we take the detections array that contains mobilenet-ssd results
+
+            detections = in_nn.detections
+
+        if frame is not None:
+            for detection in detections:
+                # for each bounding box, we first normalize it to match the frame size
+                bbox = frameNorm(frame, (detection.xmin, detection.ymin, detection.xmax, detection.ymax))
+                # and then draw a rectangle on the frame to show the actual result
+                cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (255, 0, 0), 2)
+            # After all the drawing is finished, we show the frame on the screen
+            cv2.imshow("preview", frame)
+
+        # at any time, you can press "q" and exit the main loop, therefore exiting the program itself
+        if cv2.waitKey(1) == ord('q'):
             break
-
-    cv.destroyAllWindows()
-    cv.VideoCapture(0).release()
-
-
-#   0  CV_CAP_PROP_POS_MSEC Current position of the video file in milliseconds.
-#   1  CV_CAP_PROP_POS_FRAMES 0-based index of the frame to be decoded/captured next.
-#   2  CV_CAP_PROP_POS_AVI_RATIO Relative position of the video file
-#   3  CV_CAP_PROP_FRAME_WIDTH Width of the frames in the video stream.
-#   4  CV_CAP_PROP_FRAME_HEIGHT Height of the frames in the video stream.
-#   5  CV_CAP_PROP_FPS Frame rate.
-#   6  CV_CAP_PROP_FOURCC 4-character code of codec.
-#   7  CV_CAP_PROP_FRAME_COUNT Number of frames in the video file.
-#   8  CV_CAP_PROP_FORMAT Format of the Mat objects returned by retrieve() .
-#   9 CV_CAP_PROP_MODE Backend-specific value indicating the current capture mode.
-#   10 CV_CAP_PROP_BRIGHTNESS Brightness of the image (only for cameras).
-#   11 CV_CAP_PROP_CONTRAST Contrast of the image (only for cameras).
-#   12 CV_CAP_PROP_SATURATION Saturation of the image (only for cameras).
-#   13 CV_CAP_PROP_HUE Hue of the image (only for cameras).
-#   14 CV_CAP_PROP_GAIN Gain of the image (only for cameras).
-#   15 CV_CAP_PROP_EXPOSURE Exposure (only for cameras).
-#   16 CV_CAP_PROP_CONVERT_RGB Boolean flags indicating whether images should be converted to RGB.
-#   17 CV_CAP_PROP_WHITE_BALANCE Currently unsupported
-#   18 CV_CAP_PROP_RECTIFICATION Rectification flag for stereo cameras (note: only supported by DC1394 v 2.x backend currently)
-
-if __name__ == '__main__':
-    main(sys.argv)
